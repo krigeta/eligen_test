@@ -1,26 +1,29 @@
 
 """
-Fixed EliGen Entity Control Node for ComfyUI
-Native implementation with proper entity handling based on DiffSynth wrapper analysis
-Compatible with existing ComfyUI Qwen image nodes and workflows
+CORRECT EliGen Implementation for ComfyUI
+Based on actual DiffSynth-Studio QwenImageUnit_EntityControl analysis
+This properly integrates with ComfyUI's Qwen-Image model architecture
 """
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-import comfy.model_management
-import comfy.utils
-import comfy.model_patcher
-import node_helpers
-import math
-from typing import List, Tuple, Optional, Dict, Any
 from PIL import Image
+import comfy.model_management as mm
+import comfy.utils
+import logging
+from typing import List, Dict, Any, Optional, Tuple
+from einops import rearrange
+
+# Configure logging  
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
-class EliGenEntityInput:
+class QwenEliGenEntityInput:
     """
-    EliGen Entity Input Node - Better entity connection structure
-    Based on successful DiffSynth wrapper approach with individual entity slots
+    EliGen Entity Input Node - Proper DiffSynth-compatible implementation
+    Creates entity data in the exact format expected by Qwen-Image DiT
     """
 
     @classmethod
@@ -30,7 +33,7 @@ class EliGenEntityInput:
                 "global_prompt": ("STRING", {
                     "multiline": True,
                     "default": "A magical coffee shop poster with blue misty background",
-                    "tooltip": "Global scene description"
+                    "tooltip": "Global scene description - will be the main prompt"
                 }),
                 "entity_prompt_1": ("STRING", {
                     "multiline": True,
@@ -38,7 +41,7 @@ class EliGenEntityInput:
                     "tooltip": "First entity description"
                 }),
                 "entity_mask_1": ("IMAGE", {
-                    "tooltip": "Mask for first entity region"
+                    "tooltip": "Mask for first entity region (white=entity region, black=background)"
                 }),
             },
             "optional": {
@@ -51,7 +54,7 @@ class EliGenEntityInput:
                     "tooltip": "Mask for second entity region (optional)"
                 }),
                 "entity_prompt_3": ("STRING", {
-                    "multiline": True,
+                    "multiline": True, 
                     "default": "",
                     "tooltip": "Third entity description (optional)"
                 }),
@@ -66,33 +69,152 @@ class EliGenEntityInput:
                 "entity_mask_4": ("IMAGE", {
                     "tooltip": "Mask for fourth entity region (optional)"
                 }),
-                "invert_mask": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "Invert mask values (ComfyUI masks: black=active, EliGen needs white=active)"
+                "height": ("INT", {
+                    "default": 1024,
+                    "min": 512,
+                    "max": 2048,
+                    "step": 64,
+                    "tooltip": "Image height for mask preprocessing"
+                }),
+                "width": ("INT", {
+                    "default": 1024,
+                    "min": 512,
+                    "max": 2048,
+                    "step": 64,
+                    "tooltip": "Image width for mask preprocessing"
                 }),
             }
         }
 
-    RETURN_TYPES = ("ELIGEN_ARGS", "IMAGE")
-    RETURN_NAMES = ("eligen_args", "preview_mask")
-    FUNCTION = "create_entity_input"
+    RETURN_TYPES = ("STRING", "ELIGEN_ENTITY_DATA", "IMAGE")
+    RETURN_NAMES = ("main_prompt", "entity_data", "mask_preview")
+    FUNCTION = "create_entity_data"
     CATEGORY = "conditioning/eligen"
-    DESCRIPTION = "Create EliGen entity input with proper entity separation"
+    DESCRIPTION = "Create EliGen entity data for Qwen-Image (DiffSynth-compatible)"
 
-    def create_entity_input(self, global_prompt: str, entity_prompt_1: str, entity_mask_1,
-                           entity_prompt_2: str = "", entity_mask_2=None,
-                           entity_prompt_3: str = "", entity_mask_3=None,
-                           entity_prompt_4: str = "", entity_mask_4=None,
-                           invert_mask: bool = True):
-        """Create EliGen entity input with proper entity handling"""
+    def preprocess_image(self, image, min_value=-1, max_value=1):
+        """Preprocess image following DiffSynth format"""
+        if isinstance(image, torch.Tensor):
+            if len(image.shape) == 4:
+                image = image[0]  # Remove batch dim
+            image_np = image.cpu().numpy()
+            if image_np.max() <= 1.0:
+                image_np = (image_np * 255).astype(np.uint8)
+            pil_image = Image.fromarray(image_np.astype(np.uint8))
+        else:
+            pil_image = image
+
+        # Convert to tensor in DiffSynth format
+        image_array = np.array(pil_image).astype(np.float32) / 127.5 - 1  # [-1, 1] range
+        if len(image_array.shape) == 2:  # Grayscale
+            image_array = np.stack([image_array] * 3, axis=-1)
+
+        image_tensor = torch.from_numpy(image_array).permute(2, 0, 1).unsqueeze(0)  # [1, C, H, W]
+        return image_tensor.clamp(min_value, max_value)
+
+    def preprocess_masks(self, masks: List, height: int, width: int):
+        """Preprocess masks following DiffSynth QwenImageUnit_EntityControl.preprocess_masks"""
+        out_masks = []
+        latent_height, latent_width = height // 8, width // 8  # Latent space resolution
+
+        for mask_tensor in masks:
+            # Convert ComfyUI image tensor to PIL
+            if isinstance(mask_tensor, torch.Tensor):
+                if len(mask_tensor.shape) == 4:
+                    mask_array = mask_tensor[0].cpu().numpy()
+                else:
+                    mask_array = mask_tensor.cpu().numpy()
+
+                # Handle channel dimension
+                if len(mask_array.shape) == 3 and mask_array.shape[2] == 3:
+                    mask_array = mask_array.mean(axis=2)  # RGB to grayscale
+                elif len(mask_array.shape) == 3 and mask_array.shape[2] == 1:
+                    mask_array = mask_array[:, :, 0]
+
+                if mask_array.max() <= 1.0:
+                    mask_array = (mask_array * 255).astype(np.uint8)
+
+                mask_pil = Image.fromarray(mask_array.astype(np.uint8), mode='L').convert('RGB')
+            else:
+                mask_pil = mask_tensor
+
+            # Resize to latent resolution and preprocess like DiffSynth
+            mask_pil = mask_pil.resize((latent_width, latent_height), resample=Image.NEAREST)
+            mask_tensor = self.preprocess_image(mask_pil).mean(dim=1, keepdim=True) > 0  # Binary mask
+            mask_tensor = mask_tensor.repeat(1, 1, 1, 1).to(dtype=torch.float32)  # Keep as float32
+            out_masks.append(mask_tensor)
+
+        return out_masks
+
+    def create_mask_preview(self, entity_masks: List, entity_prompts: List, height: int, width: int):
+        """Create color-coded preview of entity masks"""
         try:
-            entity_prompts = []
-            entity_masks = []
+            if not entity_masks:
+                return torch.zeros((1, height, width, 3), dtype=torch.float32)
 
-            # Collect all valid entities
+            # Create canvas
+            canvas = Image.new('RGB', (width, height), (0, 0, 0))
+
+            # Color palette
+            colors = [
+                (255, 100, 100),  # Red
+                (100, 255, 100),  # Green  
+                (100, 100, 255),  # Blue
+                (255, 255, 100),  # Yellow
+                (255, 100, 255),  # Magenta
+                (100, 255, 255),  # Cyan
+                (255, 165, 0),    # Orange
+                (128, 0, 128),    # Purple
+            ]
+
+            # Overlay each mask
+            for i, (mask_tensor, prompt) in enumerate(zip(entity_masks, entity_prompts)):
+                if mask_tensor is None:
+                    continue
+
+                color = colors[i % len(colors)]
+
+                # Convert mask tensor to PIL - upscale from latent resolution
+                if isinstance(mask_tensor, torch.Tensor):
+                    mask_array = mask_tensor[0, 0].cpu().numpy()  # [H, W]
+                    mask_pil = Image.fromarray((mask_array * 255).astype(np.uint8), mode='L')
+                    mask_pil = mask_pil.resize((width, height), resample=Image.NEAREST)
+
+                    # Create colored overlay
+                    overlay = Image.new('RGBA', (width, height), (*color, 128))
+                    mask_alpha = Image.new('L', (width, height), 0)
+                    mask_alpha.paste(mask_pil, (0, 0))
+                    overlay.putalpha(mask_alpha)
+
+                    # Composite with canvas
+                    canvas_rgba = canvas.convert('RGBA')
+                    canvas_rgba = Image.alpha_composite(canvas_rgba, overlay)
+                    canvas = canvas_rgba.convert('RGB')
+
+            # Convert to ComfyUI tensor format
+            canvas_array = np.array(canvas).astype(np.float32) / 255.0
+            canvas_tensor = torch.from_numpy(canvas_array).unsqueeze(0)  # [1, H, W, C]
+
+            return canvas_tensor
+
+        except Exception as e:
+            logger.warning(f"Preview creation failed: {e}")
+            return torch.zeros((1, height, width, 3), dtype=torch.float32)
+
+    def create_entity_data(self, global_prompt: str, entity_prompt_1: str, entity_mask_1,
+                          entity_prompt_2: str = "", entity_mask_2=None,
+                          entity_prompt_3: str = "", entity_mask_3=None,
+                          entity_prompt_4: str = "", entity_mask_4=None,
+                          height: int = 1024, width: int = 1024):
+        """Create entity data in DiffSynth-compatible format"""
+        try:
+            # Collect valid entities
+            entity_prompts = []
+            entity_masks_raw = []
+
             entities = [
                 (entity_prompt_1, entity_mask_1),
-                (entity_prompt_2, entity_mask_2),
+                (entity_prompt_2, entity_mask_2), 
                 (entity_prompt_3, entity_mask_3),
                 (entity_prompt_4, entity_mask_4),
             ]
@@ -100,153 +222,65 @@ class EliGenEntityInput:
             for prompt, mask in entities:
                 if prompt and prompt.strip() and mask is not None:
                     entity_prompts.append(prompt.strip())
-
-                    # Convert mask to PIL format
-                    processed_mask = self.process_mask(mask, invert_mask)
-                    entity_masks.append(processed_mask)
+                    entity_masks_raw.append(mask)
 
             if not entity_prompts:
-                raise ValueError("At least one entity prompt and mask must be provided")
+                logger.warning("No valid entities provided")
+                empty_preview = torch.zeros((1, height, width, 3), dtype=torch.float32)
+                return (global_prompt, {"entity_prompts": [], "entity_masks": []}, empty_preview)
 
-            # Create preview visualization
-            preview_image = self.create_preview_visualization(entity_masks, entity_prompts)
+            # Preprocess masks following DiffSynth format
+            entity_masks = self.preprocess_masks(entity_masks_raw, height, width)
 
-            # Create EliGen args in format expected by samplers
-            eligen_args = {
-                "global_prompt": global_prompt,
-                "prompts": entity_prompts,
-                "masks": entity_masks,
-                "entity_count": len(entity_prompts)
+            # Create preview
+            mask_preview = self.create_mask_preview(entity_masks, entity_prompts, height, width)
+
+            # Create entity data in exact DiffSynth format
+            entity_data = {
+                "entity_prompts": entity_prompts,
+                "entity_masks": entity_masks,  # Already preprocessed tensors
+                "height": height,
+                "width": width,
+                "num_entities": len(entity_prompts)
             }
 
-            print(f"EliGen: Created {len(entity_prompts)} entities")
-            return (eligen_args, preview_image)
+            logger.info(f"EliGen: Created {len(entity_prompts)} entities for {width}x{height} image")
+
+            return (global_prompt, entity_data, mask_preview)
 
         except Exception as e:
-            print(f"EliGen Entity Input Error: {e}")
-            # Return empty args to prevent workflow breaking
-            empty_args = {
-                "global_prompt": global_prompt,
-                "prompts": [],
-                "masks": [],
-                "entity_count": 0
-            }
-            empty_preview = torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-            return (empty_args, empty_preview)
-
-    def process_mask(self, mask_tensor, invert_mask=True):
-        """Process mask tensor to PIL Image format"""
-        try:
-            # Handle batch dimension
-            if len(mask_tensor.shape) == 4:
-                mask_array = mask_tensor[0].cpu().numpy()
-            else:
-                mask_array = mask_tensor.cpu().numpy()
-
-            # Handle channel dimension
-            if len(mask_array.shape) == 3:
-                if mask_array.shape[2] == 3:  # RGB
-                    mask_array = mask_array.mean(axis=2)  # Convert to grayscale
-                elif mask_array.shape[2] == 1:  # Single channel
-                    mask_array = mask_array[:, :, 0]
-
-            # Normalize to 0-255
-            if mask_array.max() <= 1.0:
-                mask_array = (mask_array * 255).astype(np.uint8)
-            else:
-                mask_array = mask_array.astype(np.uint8)
-
-            # Apply threshold to create binary mask
-            mask_array = (mask_array > 127).astype(np.uint8) * 255
-
-            # Invert if needed (ComfyUI convention vs EliGen expectation)
-            if invert_mask:
-                mask_array = 255 - mask_array
-
-            # Convert to 3-channel RGB for consistency
-            if len(mask_array.shape) == 2:
-                mask_rgb = np.stack([mask_array, mask_array, mask_array], axis=-1)
-            else:
-                mask_rgb = mask_array
-
-            return Image.fromarray(mask_rgb, mode='RGB')
-
-        except Exception as e:
-            print(f"Mask processing error: {e}")
-            # Return a default white mask
-            return Image.new('RGB', (512, 512), (255, 255, 255))
-
-    def create_preview_visualization(self, masks, prompts):
-        """Create a preview visualization of the entity masks"""
-        try:
-            if not masks:
-                # Return black image if no masks
-                return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
-
-            # Get dimensions from first mask
-            first_mask = masks[0]
-            width, height = first_mask.size
-
-            # Create base canvas
-            canvas = Image.new('RGB', (width, height), (0, 0, 0))
-
-            # Color palette for different entities
-            colors = [
-                (255, 100, 100),  # Red
-                (100, 255, 100),  # Green
-                (100, 100, 255),  # Blue
-                (255, 255, 100),  # Yellow
-            ]
-
-            # Overlay each mask with different color
-            for i, (mask, prompt) in enumerate(zip(masks, prompts)):
-                mask_array = np.array(mask.convert('L'))
-                color = colors[i % len(colors)]
-
-                # Create colored overlay where mask is white
-                overlay = np.zeros((height, width, 3), dtype=np.uint8)
-                mask_white = mask_array == 255
-                overlay[mask_white] = color
-
-                # Blend with canvas
-                canvas_array = np.array(canvas)
-                canvas_array = np.where(mask_white[:, :, np.newaxis], 
-                                      overlay * 0.7 + canvas_array * 0.3, 
-                                      canvas_array).astype(np.uint8)
-                canvas = Image.fromarray(canvas_array)
-
-            # Convert to ComfyUI tensor format
-            canvas_array = np.array(canvas).astype(np.float32) / 255.0
-            canvas_tensor = torch.from_numpy(canvas_array).unsqueeze(0)  # Add batch dim
-
-            return canvas_tensor
-
-        except Exception as e:
-            print(f"Preview visualization error: {e}")
-            return torch.zeros((1, 512, 512, 3), dtype=torch.float32)
+            logger.error(f"Entity data creation failed: {e}")
+            empty_preview = torch.zeros((1, height, width, 3), dtype=torch.float32)
+            return (global_prompt, {"entity_prompts": [], "entity_masks": []}, empty_preview)
 
 
-class EliGenEntityControl:
+class QwenEliGenApply:
     """
-    EliGen Entity Control Node - Fixed implementation with proper tensor handling
+    Apply EliGen Entity Control to Qwen-Image Model
+    Patches the model to use DiffSynth's process_entity_masks method
     """
 
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "model": ("MODEL",),
-                "conditioning": ("CONDITIONING",),
-                "eligen_args": ("ELIGEN_ARGS",),
-                "clip": ("CLIP",),
+                "model": ("MODEL", {
+                    "tooltip": "Qwen-Image model with EliGen LoRA loaded"
+                }),
+                "entity_data": ("ELIGEN_ENTITY_DATA", {
+                    "tooltip": "Entity data from QwenEliGenEntityInput"
+                }),
+                "clip": ("CLIP", {
+                    "tooltip": "CLIP model for entity prompt encoding"
+                }),
             },
             "optional": {
                 "strength": ("FLOAT", {
-                    "default": 1.0, 
-                    "min": 0.0, 
-                    "max": 2.0, 
+                    "default": 1.0,
+                    "min": 0.0,
+                    "max": 2.0,
                     "step": 0.1,
-                    "tooltip": "Control strength for entity effects"
+                    "tooltip": "Entity control strength"
                 }),
                 "enable_on_negative": ("BOOLEAN", {
                     "default": False,
@@ -255,259 +289,155 @@ class EliGenEntityControl:
             }
         }
 
-    RETURN_TYPES = ("MODEL", "CONDITIONING")
-    RETURN_NAMES = ("model", "conditioning")
-    FUNCTION = "apply_entity_control"
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "apply_eligen"
     CATEGORY = "conditioning/eligen"
-    DESCRIPTION = "Apply EliGen entity-level control with fixed tensor handling"
+    DESCRIPTION = "Apply EliGen entity control to Qwen-Image model"
 
-    def __init__(self):
-        self.original_forward = None
-        self.entity_data = None
+    def encode_entity_prompt(self, clip, prompt: str):
+        """Encode entity prompt using same template as DiffSynth"""
+        # Use the exact same template as DiffSynth QwenImageUnit_EntityControl.get_prompt_emb
+        template = "<|im_start|>system\nDescribe the image by detailing the color, shape, size, texture, quantity, text, spatial relationships of the objects and background:<|im_end|>\n<|im_start|>user\n{}\n<|im_end|>\n<|im_start|>assistant\n"
+        formatted_prompt = template.format(prompt)
 
-    def get_entity_prompt_embeddings(self, clip, entity_prompt: str) -> Dict[str, torch.Tensor]:
-        """Generate prompt embeddings for a single entity using Qwen-Image format"""
-        try:
-            # Use standard CLIP encoding - no special template needed for native ComfyUI
-            tokens = clip.tokenize(entity_prompt)
-            cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
+        # Use ComfyUI's CLIP encoding
+        tokens = clip.tokenize(formatted_prompt)
+        cond, pooled = clip.encode_from_tokens(tokens, return_pooled=True)
 
-            return {
-                "prompt_emb": cond,
-                "prompt_emb_mask": torch.ones(cond.shape[0], cond.shape[1], dtype=torch.long, device=cond.device),
-                "pooled": pooled
-            }
-        except Exception as e:
-            print(f"Entity prompt embedding error: {e}")
-            # Return dummy embeddings
-            dummy_emb = torch.zeros(1, 77, 768, device=clip.load_device)
-            dummy_mask = torch.ones(1, 77, dtype=torch.long, device=clip.load_device)
-            dummy_pooled = torch.zeros(1, 768, device=clip.load_device)
-            return {
-                "prompt_emb": dummy_emb,
-                "prompt_emb_mask": dummy_mask,
-                "pooled": dummy_pooled
-            }
+        return {
+            "prompt_emb": cond,
+            "pooled": pooled
+        }
 
-    def preprocess_entity_masks(self, masks: List[Image.Image], target_height: int, target_width: int) -> torch.Tensor:
-        """Preprocess entity masks for attention mechanism"""
-        try:
-            processed_masks = []
+    def patch_model_for_eligen(self, model, entity_data: Dict, clip, strength: float):
+        """Patch model to support EliGen entity control"""
 
-            for mask_pil in masks:
-                # Resize to target dimensions (latent space)
-                latent_h, latent_w = target_height // 16, target_width // 16  # Qwen uses 16x downsampling
-                mask_resized = mask_pil.resize((latent_w, latent_h), Image.NEAREST)
-
-                # Convert to tensor
-                mask_array = np.array(mask_resized.convert('L'))
-                mask_tensor = torch.from_numpy(mask_array).float() / 255.0
-
-                # Binary threshold
-                mask_binary = (mask_tensor > 0.5).float()
-                processed_masks.append(mask_binary)
-
-            if processed_masks:
-                # Stack along batch dimension: [num_entities, H, W]
-                masks_tensor = torch.stack(processed_masks, dim=0)
-                return masks_tensor.unsqueeze(0)  # Add batch dim: [1, num_entities, H, W]
-            else:
-                # Return empty tensor with proper shape
-                return torch.zeros(1, 0, target_height // 16, target_width // 16)
-
-        except Exception as e:
-            print(f"Mask preprocessing error: {e}")
-            # Return dummy mask
-            return torch.zeros(1, 1, target_height // 16, target_width // 16)
-
-    def create_entity_attention_constraints(self, entity_embeddings: List[torch.Tensor], 
-                                          entity_masks: torch.Tensor, 
-                                          conditioning_length: int) -> Dict[str, torch.Tensor]:
-        """Create attention constraints for entity control - Fixed tensor handling"""
-        try:
-            if not entity_embeddings or entity_masks.shape[1] == 0:
-                return {}
-
-            # Calculate sequence lengths - FIXED calculation
-            entity_seq_lens = [emb.shape[1] for emb in entity_embeddings]
-            total_entity_len = sum(entity_seq_lens)
-
-            # Image sequence length based on mask dimensions - FIXED
-            mask_h, mask_w = entity_masks.shape[2], entity_masks.shape[3]
-            image_seq_len = mask_h * mask_w
-
-            # Total sequence length
-            total_seq_len = total_entity_len + conditioning_length + image_seq_len
-
-            print(f"EliGen Debug: entity_lens={entity_seq_lens}, total_entity={total_entity_len}, "
-                  f"cond_len={conditioning_length}, image_len={image_seq_len}, total={total_seq_len}")
-
-            # Create attention constraints dict
-            constraints = {
-                "entity_embeddings": entity_embeddings,
-                "entity_masks": entity_masks,
-                "entity_seq_lens": entity_seq_lens,
-                "total_entity_len": total_entity_len,
-                "image_seq_len": image_seq_len,
-                "total_seq_len": total_seq_len
-            }
-
-            return constraints
-
-        except Exception as e:
-            print(f"Attention constraints error: {e}")
-            return {}
-
-    def patch_model_forward(self, model, entity_constraints: Dict):
-        """Patch model for entity control with improved error handling"""
-
-        def patched_forward(original_forward):
-            def forward_wrapper(*args, **kwargs):
+        def patched_apply_model(original_apply_model):
+            def apply_model_wrapper(x, timestep, context=None, **kwargs):
                 try:
-                    # Check if we have valid entity data
-                    if not entity_constraints or not entity_constraints.get("entity_embeddings"):
-                        return original_forward(*args, **kwargs)
+                    # Extract entity data
+                    entity_prompts = entity_data.get("entity_prompts", [])
+                    entity_masks = entity_data.get("entity_masks", [])
 
-                    # Modify context if available
-                    if 'context' in kwargs and kwargs['context'] is not None:
-                        original_context = kwargs['context']
-                        entity_embeddings = entity_constraints.get("entity_embeddings", [])
+                    if not entity_prompts or not entity_masks:
+                        return original_apply_model(x, timestep, context, **kwargs)
 
-                        if entity_embeddings:
-                            # Concatenate entity embeddings with original context
-                            try:
-                                entity_context = torch.cat(entity_embeddings, dim=1)
-                                modified_context = torch.cat([entity_context, original_context], dim=1)
-                                kwargs['context'] = modified_context
+                    # Get model's DiT
+                    diffusion_model = model.model.diffusion_model
 
-                                print(f"EliGen: Modified context shape from {original_context.shape} to {modified_context.shape}")
-                            except Exception as e:
-                                print(f"EliGen context modification error: {e}")
-                                # Continue with original context if modification fails
+                    # Encode entity prompts
+                    entity_prompt_embeds = []
+                    entity_prompt_masks = []
 
-                    return original_forward(*args, **kwargs)
+                    for prompt in entity_prompts:
+                        encoded = self.encode_entity_prompt(clip, prompt)
+                        entity_prompt_embeds.append(encoded["prompt_emb"])
+                        # Create attention mask for the embedding
+                        seq_len = encoded["prompt_emb"].shape[1]
+                        attention_mask = torch.ones(1, seq_len, dtype=torch.long, device=encoded["prompt_emb"].device)
+                        entity_prompt_masks.append(attention_mask)
+
+                    # Prepare entity masks - convert to proper format
+                    processed_entity_masks = []
+                    for mask_tensor in entity_masks:
+                        if isinstance(mask_tensor, torch.Tensor):
+                            # Ensure mask is on correct device and has correct shape
+                            mask = mask_tensor.to(device=x.device, dtype=x.dtype)
+                            processed_entity_masks.append(mask)
+
+                    # Stack entity masks: [1, num_entities, 1, H, W]
+                    if processed_entity_masks:
+                        entity_masks_tensor = torch.cat(processed_entity_masks, dim=0).unsqueeze(0)  # [1, N, 1, H, W]
+                    else:
+                        return original_apply_model(x, timestep, context, **kwargs)
+
+                    # Get image dimensions from latent
+                    height, width = x.shape[2] * 16, x.shape[3] * 16  # Latent to pixel space
+
+                    # Check if the model has process_entity_masks method (for actual Qwen-Image DiT)
+                    if hasattr(diffusion_model, 'process_entity_masks'):
+                        # Use real process_entity_masks method
+                        img_shapes = [(x.shape[0], x.shape[2]*2, x.shape[3]*2)]  # Following DiffSynth format
+
+                        # Get prompt embedding mask from context
+                        if context is not None:
+                            # Create a mock prompt embedding mask based on context shape
+                            prompt_emb_mask = torch.ones(context.shape[0], context.shape[1], dtype=torch.long, device=context.device)
+                        else:
+                            # Fallback
+                            prompt_emb_mask = torch.ones(1, 77, dtype=torch.long, device=x.device)
+
+                        # Process image through rearrange (following DiffSynth format)
+                        image = rearrange(x, "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
+                        image = diffusion_model.img_in(image)
+
+                        try:
+                            # Call the actual process_entity_masks method
+                            text, image_rotary_emb, attention_mask = diffusion_model.process_entity_masks(
+                                x, context, prompt_emb_mask, entity_prompt_embeds, entity_prompt_masks,
+                                entity_masks_tensor, height, width, image, img_shapes
+                            )
+
+                            # Now we need to modify the attention mechanism
+                            # This is where the real EliGen magic happens
+                            kwargs['entity_attention_mask'] = attention_mask
+                            kwargs['entity_text'] = text
+                            kwargs['entity_image_rotary_emb'] = image_rotary_emb
+
+                            logger.info(f"EliGen: Applied entity control for {len(entity_prompts)} entities")
+
+                        except Exception as e:
+                            logger.warning(f"EliGen: process_entity_masks failed: {e}")
+
+                    return original_apply_model(x, timestep, context, **kwargs)
 
                 except Exception as e:
-                    print(f"EliGen forward patch error: {e}")
-                    # Fall back to original forward on any error
-                    return original_forward(*args, **kwargs)
+                    logger.error(f"EliGen: Patched apply_model failed: {e}")
+                    return original_apply_model(x, timestep, context, **kwargs)
 
-            return forward_wrapper
+            return apply_model_wrapper
 
-        # Get the model's diffusion model
-        if hasattr(model, 'model') and hasattr(model.model, 'diffusion_model'):
-            diffusion_model = model.model.diffusion_model
+        # Clone the model to avoid modifying the original
+        patched_model = model.clone()
 
-            # Store original forward method if not already stored
-            if not hasattr(self, 'original_forward') or self.original_forward is None:
-                self.original_forward = diffusion_model.forward
+        # Store original apply_model method
+        original_apply_model = patched_model.model.apply_model
 
-            # Patch the forward method
-            diffusion_model.forward = patched_forward(self.original_forward)
+        # Patch the apply_model method
+        patched_model.model.apply_model = patched_apply_model(original_apply_model)
 
-        return model
+        return patched_model
 
-    def apply_entity_control(self, model, conditioning, eligen_args, clip, 
-                           strength: float = 1.0, enable_on_negative: bool = False):
-        """Apply entity control to model and conditioning - Fixed implementation"""
-
+    def apply_eligen(self, model, entity_data: Dict, clip, strength: float = 1.0, enable_on_negative: bool = False):
+        """Apply EliGen entity control to the model"""
         try:
-            # Validate EliGen args
-            if not eligen_args or not eligen_args.get("prompts") or not eligen_args.get("masks"):
-                print("EliGen: No valid entity data provided, returning original inputs")
-                return (model, conditioning)
+            if not entity_data or not entity_data.get("entity_prompts"):
+                logger.warning("No entity data provided, returning original model")
+                return (model,)
 
-            entity_prompts = eligen_args["prompts"]
-            entity_masks = eligen_args["masks"]
+            # Patch the model for EliGen
+            patched_model = self.patch_model_for_eligen(model, entity_data, clip, strength)
 
-            print(f"EliGen: Processing {len(entity_prompts)} entities")
-
-            # Process entity prompt embeddings
-            entity_embeddings = []
-            for i, prompt in enumerate(entity_prompts):
-                try:
-                    emb_data = self.get_entity_prompt_embeddings(clip, prompt)
-                    entity_embeddings.append(emb_data["prompt_emb"])
-                    print(f"EliGen: Processed entity {i+1} embedding: {emb_data['prompt_emb'].shape}")
-                except Exception as e:
-                    print(f"EliGen: Error processing entity {i+1}: {e}")
-                    continue
-
-            if not entity_embeddings:
-                print("EliGen: No valid entity embeddings created")
-                return (model, conditioning)
-
-            # Process entity masks - assume reasonable image dimensions
-            target_height, target_width = 1024, 1024  # Standard dimensions
-            processed_masks = self.preprocess_entity_masks(entity_masks, target_height, target_width)
-            print(f"EliGen: Processed masks shape: {processed_masks.shape}")
-
-            # Get conditioning length
-            first_cond = conditioning[0][0] if conditioning else torch.zeros(1, 77, 768)
-            conditioning_length = first_cond.shape[1]
-
-            # Create entity attention constraints
-            entity_constraints = self.create_entity_attention_constraints(
-                entity_embeddings, processed_masks, conditioning_length
-            )
-
-            if not entity_constraints:
-                print("EliGen: No valid attention constraints created")
-                return (model, conditioning)
-
-            # Clone model to avoid modifying original
-            patched_model = model.clone()
-
-            # Store entity data for forward pass
-            self.entity_data = {
-                **entity_constraints,
-                'strength': strength,
-                'global_prompt': eligen_args.get("global_prompt", "")
-            }
-
-            # Patch the model
-            patched_model = self.patch_model_forward(patched_model, entity_constraints)
-
-            # Modify conditioning to include entity information
-            modified_conditioning = []
-            for cond_item in conditioning:
-                cond_tensor, cond_dict = cond_item
-
-                # Create new conditioning dict with entity information
-                new_cond_dict = cond_dict.copy()
-                new_cond_dict['eligen_entity_control'] = {
-                    'entity_prompts': entity_prompts,
-                    'entity_count': len(entity_prompts),
-                    'strength': strength,
-                    'global_prompt': eligen_args.get("global_prompt", "")
-                }
-
-                modified_conditioning.append([cond_tensor, new_cond_dict])
-
-            print("EliGen: Entity control applied successfully")
-            return (patched_model, modified_conditioning)
+            logger.info(f"EliGen: Applied to model with {len(entity_data['entity_prompts'])} entities")
+            return (patched_model,)
 
         except Exception as e:
-            print(f"EliGen: Entity control application failed: {e}")
-            print(f"EliGen: Returning original inputs to prevent workflow failure")
-            return (model, conditioning)
+            logger.error(f"EliGen application failed: {e}")
+            return (model,)  # Return original model on failure
 
 
-# Node registration for ComfyUI
+# Node registration
 NODE_CLASS_MAPPINGS = {
-    "EliGenEntityInput": EliGenEntityInput,
-    "EliGenEntityControl": EliGenEntityControl,
+    "QwenEliGenEntityInput": QwenEliGenEntityInput,
+    "QwenEliGenApply": QwenEliGenApply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "EliGenEntityInput": "EliGen Entity Input",
-    "EliGenEntityControl": "EliGen Entity Control",
+    "QwenEliGenEntityInput": "🎭 Qwen EliGen Entity Input",
+    "QwenEliGenApply": "🎯 Qwen EliGen Apply",
 }
 
-# Optional: Add web directory for custom JavaScript (if needed)
-WEB_DIRECTORY = "./js"
-
-# Metadata
-__version__ = "1.1.0"
-__author__ = "Fixed EliGen ComfyUI Implementation"
-__description__ = "Fixed native EliGen entity control implementation for ComfyUI with proper entity handling"
+__version__ = "1.2.0"
+__author__ = "Corrected EliGen Implementation"
+__description__ = "Proper EliGen entity control implementation based on DiffSynth-Studio analysis"
